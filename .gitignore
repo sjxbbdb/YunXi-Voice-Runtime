@@ -1,0 +1,15 @@
+/cache/
+/logs/
+/models/
+/python/
+/sources/
+/venv/
+/.venv/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+*.wav
+*.log
+*.tmp
+.env
+.env.*
