@@ -28,11 +28,36 @@ flowchart LR
     CLIENT --> SPEAKER["扬声器"]
 ```
 
+## 双链语音架构
+
+升级后的语音运行时保留两套互不覆盖的链路：
+
+| 模式 | STT | TTS | 用途 |
+| --- | --- | --- | --- |
+| `stable`（默认） | SenseVoiceSmall | CosyVoice-300M-SFT `中文女` | 已验证兜底、最低启动风险 |
+| `quality` | faster-whisper large-v3 | IndexTTS2 + 本机 VoiceProfile | 更高识别准确率、真人感和可定制音色 |
+| `auto` | 优先质量端，未就绪时使用稳定端 | 优先质量端，未就绪时使用稳定端 | 面向日常使用的自动选择 |
+
+稳定 sidecar 与质量 worker 使用独立 Python 环境。质量端的导入失败、模型缺失、超时、空转写、无效 WAV、VoiceProfile 错误或推理异常，只会让当前 STT/TTS 端回退到稳定模型；不会重跑 YunXi Agent 对话，也不会跳过人格、记忆、陪伴、工具或审批。连续质量故障会触发按端熔断，冷却后再试。
+
+```mermaid
+flowchart LR
+    AUDIO["同一份内存音频"] --> ROUTER["VoiceBackendRouter"]
+    ROUTER -->|"quality / auto"| WHISPER["faster-whisper large-v3"]
+    WHISPER -->|"失败或超时"| SENSE["SenseVoiceSmall"]
+    TEXT["YunXi Runtime 回复文本"] --> ROUTER
+    ROUTER --> INDEX["IndexTTS2 + VoiceProfile"]
+    INDEX -->|"失败或超时"| COSY["CosyVoice 中文女"]
+```
+
 ## 仓库包含与不包含的内容
 
 本仓库只保存可审查、可复现的源码：
 
 - `runtime_server.py`：回环 HTTP sidecar
+- `quality_runtime_server.py`：隔离运行的质量模型 worker
+- `voice_router.py`：模式选择、按端降级、超时和熔断
+- `voice_profile.py` / `voice-profile.example.json`：本机音色配置契约与模板
 - `install-voice-runtime.ps1`：Python、依赖、上游源码和模型安装器
 - `start-voice-runtime.ps1`：真实或 mock 服务启动器
 - `test_runtime_server.py`：纯 Python 单元测试
@@ -71,6 +96,11 @@ flowchart LR
 | `sources/CosyVoice/` | FunAudioLLM/CosyVoice 源码 |
 | `sources/CosyVoice/third_party/Matcha-TTS/` | Matcha-TTS 源码 |
 | `cache/` | uv、ModelScope 和 Hugging Face 缓存 |
+| `quality-venv/` | IndexTTS2 官方锁定依赖与 faster-whisper |
+| `models/faster-whisper-large-v3/` | `Systran/faster-whisper-large-v3` |
+| `models/IndexTTS-2/` | 固定 revision 的 `IndexTeam/IndexTTS-2` |
+| `sources/index-tts/` | 固定 commit 的 IndexTTS2 官方源码 |
+| `profiles/` | 仅本机保存的音色参考、情绪参考与 VoiceProfile |
 
 ## 本地部署
 
@@ -100,12 +130,44 @@ Set-Location "D:\YunXi Voice Runtime Source"
 
 安装器最后会验证 CUDA、PyTorch、torchaudio、FunASR 与 CosyVoice 是否能被真实加载。不要把源码 checkout 与 `RuntimeRoot` 指向同一个目录。
 
-### 4. 启动 sidecar
+额外安装质量链（不会删除或替换稳定模型）：
+
+```powershell
+.\install-voice-runtime.ps1 -RuntimeRoot "D:\YunXi Voice Runtime" -IncludeQuality
+```
+
+IndexTTS2 源码固定在 commit `90ca4d608209584bad3a5bd5becc0b80c146e60f`，模型固定在 revision `740dcaff396282ffb241903d150ac011cd4b1ede`；不要让部署脚本直接跟踪其可变 `main` 分支。IndexTTS2 使用自定义的 `bilibili Model Use License Agreement`，源码和权重只下载到本机运行目录，不复制进本仓库。
+
+### 4. 配置质量音色
+
+把模板复制到被 Git 忽略的本机目录，然后放入你有权使用的参考音频：
+
+```powershell
+$profileRoot = "D:\YunXi Voice Runtime\profiles\yunxi-primary"
+New-Item -ItemType Directory -Path "$profileRoot\references" -Force
+Copy-Item .\voice-profile.example.json "$profileRoot\profile.json"
+```
+
+编辑 `profile.json`，确保 `reference_transcript` 与 `reference_audio` 逐字一致。中性参考音频是必需项；情绪参考可逐步补充。音频、转写、特征和生成 WAV 都不得提交 Git。`speed` 当前作为 profile 元数据保留，IndexTTS2 v2 的稳定公开 API 暂不应用变速。
+
+### 5. 启动 sidecar
 
 ```powershell
 Set-Location "D:\YunXi Voice Runtime Source"
 .\start-voice-runtime.ps1 -RuntimeRoot "D:\YunXi Voice Runtime"
 ```
+
+默认仍为 `stable`。启用质量链或自动选择：
+
+```powershell
+.\start-voice-runtime.ps1 -RuntimeRoot "D:\YunXi Voice Runtime" -Mode quality `
+  -VoiceProfile "D:\YunXi Voice Runtime\profiles\yunxi-primary\profile.json"
+
+.\start-voice-runtime.ps1 -RuntimeRoot "D:\YunXi Voice Runtime" -Mode auto `
+  -VoiceProfile "D:\YunXi Voice Runtime\profiles\yunxi-primary\profile.json"
+```
+
+启动器只在 `quality` / `auto` 下拉起隔离 worker。worker 无法启动时会保留主 sidecar 和稳定链，不会因质量模型不可用而让文字对话失效。
 
 服务只允许绑定 `127.0.0.1`、`localhost` 或 `::1`。另开一个终端验证：
 
@@ -158,6 +220,12 @@ yunxi voice doctor
 | `YUNXI_VOICE_STT_MODEL_DIR` | SenseVoiceSmall 本地路径或模型 ID |
 | `YUNXI_VOICE_TTS_MODEL_DIR` | CosyVoice 本地路径或模型 ID |
 | `YUNXI_COSYVOICE_REPO` | CosyVoice 源码目录 |
+| `YUNXI_VOICE_MODE` | `stable`、`quality` 或 `auto`；默认 `stable` |
+| `YUNXI_VOICE_PROFILE` | 本机 VoiceProfile JSON 的绝对路径 |
+| `YUNXI_VOICE_QUALITY_URL` | 隔离质量 worker 地址；默认 `http://127.0.0.1:17864` |
+| `YUNXI_VOICE_QUALITY_TIMEOUT_SECONDS` | 单次质量 STT/TTS 超时；默认 45 秒 |
+| `YUNXI_VOICE_QUALITY_FAILURE_THRESHOLD` | 按端熔断阈值；默认 3 次 |
+| `YUNXI_VOICE_QUALITY_CIRCUIT_COOLDOWN_SECONDS` | 熔断冷却；默认 120 秒 |
 | `YUNXI_VOICE_AUTH_TOKEN` | 可选本地 Bearer Token；两端值必须相同 |
 | `YUNXI_VOICE_ALLOW_REMOTE` | 设为 `1` 才允许 Rust 客户端连接非回环地址 |
 
@@ -170,6 +238,8 @@ yunxi voice doctor
 | `POST` | `/v1/synthesize` | `{text, voice, format:"wav"}` | `audio/wav` |
 
 主仓库中的 `yunxi-agent-voice` 会校验 schema、输入输出大小、URL 范围和可选 Bearer Token。协议变更必须先保持两个仓库兼容，再分别发布。
+
+`GET /health` 保持 schema v1，并向后兼容地增加 `mode`、`backends`、`active`、`fallback`、`circuit_breaker` 与 `capabilities`。未来全双工/低延迟流式能力会新增 WebSocket API v2，不会破坏现有 HTTP v1。
 
 ## 测试
 
@@ -200,6 +270,7 @@ python .\smoke_mock.py
 - 默认仅监听回环地址，不作为网络服务部署。
 - 麦克风音频由 YunXi Agent 保存在内存中；sidecar 转写临时文件在请求结束后删除。
 - 请求体和转写文本不写日志。
+- VoiceProfile 的参考音频路径和原文不出现在公开健康信息或普通请求日志中。
 - 不要把 Token 写入仓库、README、脚本或截图。
 - 语音不会自动批准工具调用，所有审批仍由 YunXi Agent 控制。
-- 当前实时模式是半双工，不包含流式 STT、服务端流式 TTS、语音插话或音色克隆。
+- 当前质量模式已支持 VoiceProfile 驱动的音色克隆；实时模式仍是半双工，尚不包含流式 STT、服务端流式 TTS 或语音插话。
